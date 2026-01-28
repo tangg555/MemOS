@@ -1,10 +1,12 @@
 import contextlib
 import hashlib
 import json
+import traceback
 
 from typing import TYPE_CHECKING
 
 from memos.log import get_logger
+from memos.mem_cube.general import GeneralMemCube
 from memos.mem_scheduler.general_modules.scheduler_context import SchedulerContext
 from memos.mem_scheduler.schemas.message_schemas import ScheduleMessageItem
 from memos.mem_scheduler.schemas.task_schemas import (
@@ -27,6 +29,59 @@ class MemReorganizeHandler(BaseHandler):
     def __init__(self, context: SchedulerContext):
         super().__init__(context)
         self.expected_task_label = MEM_ORGANIZE_TASK_LABEL
+
+    def process_memories_with_reorganize(
+        self,
+        mem_ids: list[str],
+        user_id: str,
+        mem_cube_id: str,
+        mem_cube: GeneralMemCube,
+        text_mem: TreeTextMemory,
+        user_name: str,
+    ) -> None:
+        """
+        Process memories using mem_reorganize for enhanced memory processing.
+
+        Args:
+            mem_ids: List of memory IDs to process
+            user_id: User ID
+            mem_cube_id: Memory cube ID
+            mem_cube: Memory cube instance
+            text_mem: Text memory instance
+        """
+        try:
+            # Get the mem_reader from the parent MOSCore
+            if not self.context.mem_reader:
+                logger.warning(
+                    "mem_reader not available in scheduler, skipping enhanced processing"
+                )
+                return
+
+            # Get the original memory items
+            memory_items = []
+            for mem_id in mem_ids:
+                try:
+                    memory_item = text_mem.get(mem_id, user_name=user_name)
+                    memory_items.append(memory_item)
+                except Exception as e:
+                    logger.warning(f"Failed to get memory {mem_id}: {e}|{traceback.format_exc()}")
+                    continue
+
+            if not memory_items:
+                logger.warning("No valid memory items found for processing")
+                return
+
+            # Use mem_reader to process the memories
+            logger.info(f"Processing {len(memory_items)} memories with mem_reader")
+            text_mem.memory_manager.remove_and_refresh_memory(user_name=user_name)
+            logger.info("Remove and Refresh Memories")
+            logger.debug(f"Finished add {user_id} memory: {mem_ids}")
+
+        except Exception:
+            logger.error(
+                f"Error in process_memories_with_reorganize: {traceback.format_exc()}",
+                exc_info=True,
+            )
 
     def batch_handler(self, user_id: str, mem_cube_id: str, batch: list[ScheduleMessageItem]):
         for message in batch:
@@ -58,17 +113,14 @@ class MemReorganizeHandler(BaseHandler):
                     continue
 
                 # Use mem_reader to process the memories
-                if self.context.process_memories_with_reorganize:
-                    self.context.process_memories_with_reorganize(
-                        mem_ids=mem_ids,
-                        user_id=user_id,
-                        mem_cube_id=mem_cube_id,
-                        mem_cube=mem_cube,
-                        text_mem=text_mem,
-                        user_name=user_name,
-                    )
-                else:
-                    logger.error("process_memories_with_reorganize not available in context")
+                self.process_memories_with_reorganize(
+                    mem_ids=mem_ids,
+                    user_id=user_id,
+                    mem_cube_id=mem_cube_id,
+                    mem_cube=mem_cube,
+                    text_mem=text_mem,
+                    user_name=user_name,
+                )
 
                 with contextlib.suppress(Exception):
                     mem_items: list[TextualMemoryItem] = []

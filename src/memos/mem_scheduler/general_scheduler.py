@@ -1,24 +1,19 @@
-import contextlib
-import json
-import traceback
+from collections.abc import Callable
 
 from memos.configs.mem_scheduler import GeneralSchedulerConfig
 from memos.log import get_logger
-from memos.mem_cube.general import GeneralMemCube
 from memos.mem_scheduler.base_scheduler import BaseScheduler
 from memos.mem_scheduler.general_modules.scheduler_context import SchedulerContext
 from memos.mem_scheduler.schemas.message_schemas import ScheduleMessageItem
 from memos.mem_scheduler.schemas.task_schemas import (
     ADD_TASK_LABEL,
     ANSWER_TASK_LABEL,
-    LONG_TERM_MEMORY_TYPE,
     MEM_FEEDBACK_TASK_LABEL,
     MEM_ORGANIZE_TASK_LABEL,
     MEM_READ_TASK_LABEL,
     MEM_UPDATE_TASK_LABEL,
     PREF_ADD_TASK_LABEL,
     QUERY_TASK_LABEL,
-    USER_INPUT_TYPE,
 )
 from memos.mem_scheduler.task_schedule_modules.handlers.add_handler import AddHandler
 from memos.mem_scheduler.task_schedule_modules.handlers.answer_handler import AnswerHandler
@@ -34,19 +29,6 @@ from memos.mem_scheduler.task_schedule_modules.handlers.memory_update_handler im
 )
 from memos.mem_scheduler.task_schedule_modules.handlers.pref_add_handler import PrefAddHandler
 from memos.mem_scheduler.task_schedule_modules.handlers.query_handler import QueryHandler
-from memos.mem_scheduler.utils.filter_utils import (
-    transform_name_to_key,
-)
-from memos.mem_scheduler.utils.misc_utils import (
-    is_cloud_env,
-)
-from memos.memories.textual.item import TextualMemoryItem
-from memos.memories.textual.naive import NaiveTextMemory
-from memos.memories.textual.tree import TreeTextMemory
-from memos.types import (
-    MemCubeID,
-    UserID,
-)
 
 
 logger = get_logger(__name__)
@@ -76,708 +58,107 @@ class GeneralScheduler(BaseScheduler):
         }
         self.dispatcher.register_handlers(handlers)
 
-    def log_add_messages(self, msg: ScheduleMessageItem):
-        try:
-            userinput_memory_ids = json.loads(msg.content)
-        except Exception as e:
-            logger.error(f"Error: {e}. Content: {msg.content}", exc_info=True)
-            userinput_memory_ids = []
-
-        # Prepare data for both logging paths, fetching original content for updates
-        prepared_add_items = []
-        prepared_update_items_with_original = []
-        missing_ids: list[str] = []
-
-        for memory_id in userinput_memory_ids:
-            try:
-                # This mem_item represents the NEW content that was just added/processed
-                mem_item: TextualMemoryItem | None = None
-                mem_item = self.mem_cube.text_mem.get(
-                    memory_id=memory_id, user_name=msg.mem_cube_id
-                )
-                if mem_item is None:
-                    raise ValueError(f"Memory {memory_id} not found after retries")
-                # Check if a memory with the same key already exists (determining if it's an update)
-                key = getattr(mem_item.metadata, "key", None) or transform_name_to_key(
-                    name=mem_item.memory
-                )
-                exists = False
-                original_content = None
-                original_item_id = None
-
-                # Only check graph_store if a key exists and the text_mem has a graph_store
-                if key and hasattr(self.mem_cube.text_mem, "graph_store"):
-                    candidates = self.mem_cube.text_mem.graph_store.get_by_metadata(
-                        [
-                            {"field": "key", "op": "=", "value": key},
-                            {
-                                "field": "memory_type",
-                                "op": "=",
-                                "value": mem_item.metadata.memory_type,
-                            },
-                        ]
-                    )
-                    if candidates:
-                        exists = True
-                        original_item_id = candidates[0]
-                        # Crucial step: Fetch the original content for updates
-                        # This `get` is for the *existing* memory that will be updated
-                        original_mem_item = self.mem_cube.text_mem.get(
-                            memory_id=original_item_id, user_name=msg.mem_cube_id
-                        )
-                        original_content = original_mem_item.memory
-
-                if exists:
-                    prepared_update_items_with_original.append(
-                        {
-                            "new_item": mem_item,
-                            "original_content": original_content,
-                            "original_item_id": original_item_id,
-                        }
-                    )
-                else:
-                    prepared_add_items.append(mem_item)
-
-            except Exception:
-                missing_ids.append(memory_id)
-                logger.debug(
-                    f"This MemoryItem {memory_id} has already been deleted or an error occurred during preparation."
-                )
-
-        if missing_ids:
-            content_preview = (
-                msg.content[:200] + "..."
-                if isinstance(msg.content, str) and len(msg.content) > 200
-                else msg.content
-            )
-            logger.warning(
-                "Missing TextualMemoryItem(s) during add log preparation. "
-                "memory_ids=%s user_id=%s mem_cube_id=%s task_id=%s item_id=%s redis_msg_id=%s label=%s stream_key=%s content_preview=%s",
-                missing_ids,
-                msg.user_id,
-                msg.mem_cube_id,
-                msg.task_id,
-                msg.item_id,
-                getattr(msg, "redis_message_id", ""),
-                msg.label,
-                getattr(msg, "stream_key", ""),
-                content_preview,
-            )
-
-        if not prepared_add_items and not prepared_update_items_with_original:
-            logger.warning(
-                "No add/update items prepared; skipping addMemory/knowledgeBaseUpdate logs. "
-                "user_id=%s mem_cube_id=%s task_id=%s item_id=%s redis_msg_id=%s label=%s stream_key=%s missing_ids=%s",
-                msg.user_id,
-                msg.mem_cube_id,
-                msg.task_id,
-                msg.item_id,
-                getattr(msg, "redis_message_id", ""),
-                msg.label,
-                getattr(msg, "stream_key", ""),
-                missing_ids,
-            )
-        return prepared_add_items, prepared_update_items_with_original
-
-    def send_add_log_messages_to_local_env(
-        self, msg: ScheduleMessageItem, prepared_add_items, prepared_update_items_with_original
-    ):
-        # Existing: Playground/Default Logging
-        # Reconstruct add_content/add_meta/update_content/update_meta from prepared_items
-        # This ensures existing logging path continues to work with pre-existing data structures
-        add_content_legacy: list[dict] = []
-        add_meta_legacy: list[dict] = []
-        update_content_legacy: list[dict] = []
-        update_meta_legacy: list[dict] = []
-
-        for item in prepared_add_items:
-            key = getattr(item.metadata, "key", None) or transform_name_to_key(name=item.memory)
-            add_content_legacy.append({"content": f"{key}: {item.memory}", "ref_id": item.id})
-            add_meta_legacy.append(
-                {
-                    "ref_id": item.id,
-                    "id": item.id,
-                    "key": item.metadata.key,
-                    "memory": item.memory,
-                    "memory_type": item.metadata.memory_type,
-                    "status": item.metadata.status,
-                    "confidence": item.metadata.confidence,
-                    "tags": item.metadata.tags,
-                    "updated_at": getattr(item.metadata, "updated_at", None)
-                    or getattr(item.metadata, "update_at", None),
-                }
-            )
-
-        for item_data in prepared_update_items_with_original:
-            item = item_data["new_item"]
-            key = getattr(item.metadata, "key", None) or transform_name_to_key(name=item.memory)
-            update_content_legacy.append({"content": f"{key}: {item.memory}", "ref_id": item.id})
-            update_meta_legacy.append(
-                {
-                    "ref_id": item.id,
-                    "id": item.id,
-                    "key": item.metadata.key,
-                    "memory": item.memory,
-                    "memory_type": item.metadata.memory_type,
-                    "status": item.metadata.status,
-                    "confidence": item.metadata.confidence,
-                    "tags": item.metadata.tags,
-                    "updated_at": getattr(item.metadata, "updated_at", None)
-                    or getattr(item.metadata, "update_at", None),
-                }
-            )
-
-        events = []
-        if add_content_legacy:
-            event = self.create_event_log(
-                label="addMemory",
-                from_memory_type=USER_INPUT_TYPE,
-                to_memory_type=LONG_TERM_MEMORY_TYPE,
-                user_id=msg.user_id,
-                mem_cube_id=msg.mem_cube_id,
-                mem_cube=self.mem_cube,
-                memcube_log_content=add_content_legacy,
-                metadata=add_meta_legacy,
-                memory_len=len(add_content_legacy),
-                memcube_name=self._map_memcube_name(msg.mem_cube_id),
-            )
-            event.task_id = msg.task_id
-            events.append(event)
-        if update_content_legacy:
-            event = self.create_event_log(
-                label="updateMemory",
-                from_memory_type=LONG_TERM_MEMORY_TYPE,
-                to_memory_type=LONG_TERM_MEMORY_TYPE,
-                user_id=msg.user_id,
-                mem_cube_id=msg.mem_cube_id,
-                mem_cube=self.mem_cube,
-                memcube_log_content=update_content_legacy,
-                metadata=update_meta_legacy,
-                memory_len=len(update_content_legacy),
-                memcube_name=self._map_memcube_name(msg.mem_cube_id),
-            )
-            event.task_id = msg.task_id
-            events.append(event)
-        logger.info(f"send_add_log_messages_to_local_env: {len(events)}")
-        if events:
-            self._submit_web_logs(events, additional_log_info="send_add_log_messages_to_cloud_env")
-
-    def send_add_log_messages_to_cloud_env(
-        self, msg: ScheduleMessageItem, prepared_add_items, prepared_update_items_with_original
-    ):
-        """
-        Cloud logging path for add/update events.
-        """
-        kb_log_content: list[dict] = []
-        info = msg.info or {}
-
-        # Process added items
-        for item in prepared_add_items:
-            metadata = getattr(item, "metadata", None)
-            file_ids = getattr(metadata, "file_ids", None) if metadata else None
-            source_doc_id = file_ids[0] if isinstance(file_ids, list) and file_ids else None
-            kb_log_content.append(
-                {
-                    "log_source": "KNOWLEDGE_BASE_LOG",
-                    "trigger_source": info.get("trigger_source", "Messages"),
-                    "operation": "ADD",
-                    "memory_id": item.id,
-                    "content": item.memory,
-                    "original_content": None,
-                    "source_doc_id": source_doc_id,
-                }
-            )
-
-        # Process updated items
-        for item_data in prepared_update_items_with_original:
-            item = item_data["new_item"]
-            metadata = getattr(item, "metadata", None)
-            file_ids = getattr(metadata, "file_ids", None) if metadata else None
-            source_doc_id = file_ids[0] if isinstance(file_ids, list) and file_ids else None
-            kb_log_content.append(
-                {
-                    "log_source": "KNOWLEDGE_BASE_LOG",
-                    "trigger_source": info.get("trigger_source", "Messages"),
-                    "operation": "UPDATE",
-                    "memory_id": item.id,
-                    "content": item.memory,
-                    "original_content": item_data.get("original_content"),
-                    "source_doc_id": source_doc_id,
-                }
-            )
-
-        if kb_log_content:
-            logger.info(
-                f"[DIAGNOSTIC] general_scheduler.send_add_log_messages_to_cloud_env: Creating event log for KB update. Label: knowledgeBaseUpdate, user_id: {msg.user_id}, mem_cube_id: {msg.mem_cube_id}, task_id: {msg.task_id}. KB content: {json.dumps(kb_log_content, indent=2)}"
-            )
-            event = self.create_event_log(
-                label="knowledgeBaseUpdate",
-                from_memory_type=USER_INPUT_TYPE,
-                to_memory_type=LONG_TERM_MEMORY_TYPE,
-                user_id=msg.user_id,
-                mem_cube_id=msg.mem_cube_id,
-                mem_cube=self.mem_cube,
-                memcube_log_content=kb_log_content,
-                metadata=None,
-                memory_len=len(kb_log_content),
-                memcube_name=self._map_memcube_name(msg.mem_cube_id),
-            )
-            event.log_content = f"Knowledge Base Memory Update: {len(kb_log_content)} changes."
-            event.task_id = msg.task_id
-            self._submit_web_logs([event])
-
-    def _process_memories_with_reader(
-        self,
-        mem_ids: list[str],
-        user_id: str,
-        mem_cube_id: str,
-        text_mem: TreeTextMemory,
-        user_name: str,
-        custom_tags: list[str] | None = None,
-        task_id: str | None = None,
-        info: dict | None = None,
-    ) -> None:
-        logger.info(
-            f"[DIAGNOSTIC] general_scheduler._process_memories_with_reader called. mem_ids: {mem_ids}, user_id: {user_id}, mem_cube_id: {mem_cube_id}, task_id: {task_id}"
-        )
-        """
-        Process memories using mem_reader for enhanced memory processing.
-
-        Args:
-            mem_ids: List of memory IDs to process
-            user_id: User ID
-            mem_cube_id: Memory cube ID
-            text_mem: Text memory instance
-            custom_tags: Optional list of custom tags for memory processing
-        """
-        kb_log_content: list[dict] = []
-        try:
-            # Get the mem_reader from the parent MOSCore
-            if not hasattr(self, "mem_reader") or self.mem_reader is None:
-                logger.warning(
-                    "mem_reader not available in scheduler, skipping enhanced processing"
-                )
-                return
-
-            # Get the original memory items
-            memory_items = []
-            for mem_id in mem_ids:
-                try:
-                    memory_item = text_mem.get(mem_id, user_name=user_name)
-                    memory_items.append(memory_item)
-                except Exception as e:
-                    logger.warning(
-                        f"[_process_memories_with_reader] Failed to get memory {mem_id}: {e}"
-                    )
-                    continue
-
-            if not memory_items:
-                logger.warning("No valid memory items found for processing")
-                return
-
-            # parse working_binding ids from the *original* memory_items (the raw items created in /add)
-            # these still carry metadata.background with "[working_binding:...]" so we can know
-            # which WorkingMemory clones should be cleaned up later.
-            from memos.memories.textual.tree_text_memory.organize.manager import (
-                extract_working_binding_ids,
-            )
-
-            bindings_to_delete = extract_working_binding_ids(memory_items)
-            logger.info(
-                f"Extracted {len(bindings_to_delete)} working_binding ids to cleanup: {list(bindings_to_delete)}"
-            )
-
-            # Use mem_reader to process the memories
-            logger.info(f"Processing {len(memory_items)} memories with mem_reader")
-
-            # Extract memories using mem_reader
-            try:
-                processed_memories = self.mem_reader.fine_transfer_simple_mem(
-                    memory_items,
-                    type="chat",
-                    custom_tags=custom_tags,
-                    user_name=user_name,
-                )
-            except Exception as e:
-                logger.warning(f"{e}: Fail to transfer mem: {memory_items}")
-                processed_memories = []
-
-            if processed_memories and len(processed_memories) > 0:
-                # Flatten the results (mem_reader returns list of lists)
-                flattened_memories = []
-                for memory_list in processed_memories:
-                    flattened_memories.extend(memory_list)
-
-                logger.info(f"mem_reader processed {len(flattened_memories)} enhanced memories")
-
-                # Add the enhanced memories back to the memory system
-                if flattened_memories:
-                    enhanced_mem_ids = text_mem.add(flattened_memories, user_name=user_name)
-                    logger.info(
-                        f"Added {len(enhanced_mem_ids)} enhanced memories: {enhanced_mem_ids}"
-                    )
-
-                    # Mark merged_from memories as archived when provided in memory metadata
-                    if self.mem_reader.graph_db:
-                        for memory in flattened_memories:
-                            merged_from = (memory.metadata.info or {}).get("merged_from")
-                            if merged_from:
-                                old_ids = (
-                                    merged_from
-                                    if isinstance(merged_from, (list | tuple | set))
-                                    else [merged_from]
-                                )
-                                for old_id in old_ids:
-                                    try:
-                                        self.mem_reader.graph_db.update_node(
-                                            str(old_id), {"status": "archived"}, user_name=user_name
-                                        )
-                                        logger.info(
-                                            f"[Scheduler] Archived merged_from memory: {old_id}"
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"[Scheduler] Failed to archive merged_from memory {old_id}: {e}"
-                                        )
-                    else:
-                        # Check if any memory has merged_from but graph_db is unavailable
-                        has_merged_from = any(
-                            (m.metadata.info or {}).get("merged_from") for m in flattened_memories
-                        )
-                        if has_merged_from:
-                            logger.warning(
-                                "[Scheduler] merged_from provided but graph_db is unavailable; skip archiving."
-                            )
-
-                    # LOGGING BLOCK START
-                    # This block is replicated from _add_message_consumer to ensure consistent logging
-                    cloud_env = is_cloud_env()
-                    if cloud_env:
-                        # New: Knowledge Base Logging (Cloud Service)
-                        kb_log_content = []
-                        for item in flattened_memories:
-                            metadata = getattr(item, "metadata", None)
-                            file_ids = getattr(metadata, "file_ids", None) if metadata else None
-                            source_doc_id = (
-                                file_ids[0] if isinstance(file_ids, list) and file_ids else None
-                            )
-                            kb_log_content.append(
-                                {
-                                    "log_source": "KNOWLEDGE_BASE_LOG",
-                                    "trigger_source": info.get("trigger_source", "Messages")
-                                    if info
-                                    else "Messages",
-                                    "operation": "ADD",
-                                    "memory_id": item.id,
-                                    "content": item.memory,
-                                    "original_content": None,
-                                    "source_doc_id": source_doc_id,
-                                }
-                            )
-                        if kb_log_content:
-                            logger.info(
-                                f"[DIAGNOSTIC] general_scheduler._process_memories_with_reader: Creating event log for KB update. Label: knowledgeBaseUpdate, user_id: {user_id}, mem_cube_id: {mem_cube_id}, task_id: {task_id}. KB content: {json.dumps(kb_log_content, indent=2)}"
-                            )
-                            event = self.create_event_log(
-                                label="knowledgeBaseUpdate",
-                                from_memory_type=USER_INPUT_TYPE,
-                                to_memory_type=LONG_TERM_MEMORY_TYPE,
-                                user_id=user_id,
-                                mem_cube_id=mem_cube_id,
-                                mem_cube=self.mem_cube,
-                                memcube_log_content=kb_log_content,
-                                metadata=None,
-                                memory_len=len(kb_log_content),
-                                memcube_name=self._map_memcube_name(mem_cube_id),
-                            )
-                            event.log_content = (
-                                f"Knowledge Base Memory Update: {len(kb_log_content)} changes."
-                            )
-                            event.task_id = task_id
-                            self._submit_web_logs([event])
-                    else:
-                        # Existing: Playground/Default Logging
-                        add_content_legacy: list[dict] = []
-                        add_meta_legacy: list[dict] = []
-                        for item_id, item in zip(
-                            enhanced_mem_ids, flattened_memories, strict=False
-                        ):
-                            key = getattr(item.metadata, "key", None) or transform_name_to_key(
-                                name=item.memory
-                            )
-                            add_content_legacy.append(
-                                {"content": f"{key}: {item.memory}", "ref_id": item_id}
-                            )
-                            add_meta_legacy.append(
-                                {
-                                    "ref_id": item_id,
-                                    "id": item_id,
-                                    "key": item.metadata.key,
-                                    "memory": item.memory,
-                                    "memory_type": item.metadata.memory_type,
-                                    "status": item.metadata.status,
-                                    "confidence": item.metadata.confidence,
-                                    "tags": item.metadata.tags,
-                                    "updated_at": getattr(item.metadata, "updated_at", None)
-                                    or getattr(item.metadata, "update_at", None),
-                                }
-                            )
-                        if add_content_legacy:
-                            event = self.create_event_log(
-                                label="addMemory",
-                                from_memory_type=USER_INPUT_TYPE,
-                                to_memory_type=LONG_TERM_MEMORY_TYPE,
-                                user_id=user_id,
-                                mem_cube_id=mem_cube_id,
-                                mem_cube=self.mem_cube,
-                                memcube_log_content=add_content_legacy,
-                                metadata=add_meta_legacy,
-                                memory_len=len(add_content_legacy),
-                                memcube_name=self._map_memcube_name(mem_cube_id),
-                            )
-                            event.task_id = task_id
-                            self._submit_web_logs([event])
-                    # LOGGING BLOCK END
-                else:
-                    logger.info("No enhanced memories generated by mem_reader")
-            else:
-                logger.info("mem_reader returned no processed memories")
-
-            # build full delete list:
-            # - original raw mem_ids (temporary fast memories)
-            # - any bound working memories referenced by the enhanced memories
-            delete_ids = list(mem_ids)
-            if bindings_to_delete:
-                delete_ids.extend(list(bindings_to_delete))
-            # deduplicate
-            delete_ids = list(dict.fromkeys(delete_ids))
-            if delete_ids:
-                try:
-                    text_mem.delete(delete_ids, user_name=user_name)
-                    logger.info(
-                        f"Delete raw/working mem_ids: {delete_ids} for user_name: {user_name}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to delete some mem_ids {delete_ids}: {e}")
-            else:
-                logger.info("No mem_ids to delete (nothing to cleanup)")
-
-            text_mem.memory_manager.remove_and_refresh_memory(user_name=user_name)
-            logger.info("Remove and Refresh Memories")
-            logger.debug(f"Finished add {user_id} memory: {mem_ids}")
-
-        except Exception as exc:
-            logger.error(
-                f"Error in _process_memories_with_reader: {traceback.format_exc()}", exc_info=True
-            )
-            with contextlib.suppress(Exception):
-                cloud_env = is_cloud_env()
-                if cloud_env:
-                    if not kb_log_content:
-                        trigger_source = (
-                            info.get("trigger_source", "Messages") if info else "Messages"
-                        )
-                        kb_log_content = [
-                            {
-                                "log_source": "KNOWLEDGE_BASE_LOG",
-                                "trigger_source": trigger_source,
-                                "operation": "ADD",
-                                "memory_id": mem_id,
-                                "content": None,
-                                "original_content": None,
-                                "source_doc_id": None,
-                            }
-                            for mem_id in mem_ids
-                        ]
-                    event = self.create_event_log(
-                        label="knowledgeBaseUpdate",
-                        from_memory_type=USER_INPUT_TYPE,
-                        to_memory_type=LONG_TERM_MEMORY_TYPE,
-                        user_id=user_id,
-                        mem_cube_id=mem_cube_id,
-                        mem_cube=self.mem_cube,
-                        memcube_log_content=kb_log_content,
-                        metadata=None,
-                        memory_len=len(kb_log_content),
-                        memcube_name=self._map_memcube_name(mem_cube_id),
-                    )
-                    event.log_content = f"Knowledge Base Memory Update failed: {exc!s}"
-                    event.task_id = task_id
-                    event.status = "failed"
-                    self._submit_web_logs([event])
-
-    def _process_memories_with_reorganize(
-        self,
-        mem_ids: list[str],
-        user_id: str,
-        mem_cube_id: str,
-        mem_cube: GeneralMemCube,
-        text_mem: TreeTextMemory,
-        user_name: str,
+    def register_handlers(
+        self, handlers: dict[str, Callable[[list[ScheduleMessageItem]], None]]
     ) -> None:
         """
-        Process memories using mem_reorganize for enhanced memory processing.
+        Bulk register multiple handlers from a dictionary.
 
         Args:
-            mem_ids: List of memory IDs to process
-            user_id: User ID
-            mem_cube_id: Memory cube ID
-            mem_cube: Memory cube instance
-            text_mem: Text memory instance
+            handlers: Dictionary mapping labels to handler functions
+                      Format: {label: handler_callable}
         """
-        try:
-            # Get the mem_reader from the parent MOSCore
-            if not hasattr(self, "mem_reader") or self.mem_reader is None:
-                logger.warning(
-                    "mem_reader not available in scheduler, skipping enhanced processing"
-                )
-                return
-
-            # Get the original memory items
-            memory_items = []
-            for mem_id in mem_ids:
-                try:
-                    memory_item = text_mem.get(mem_id, user_name=user_name)
-                    memory_items.append(memory_item)
-                except Exception as e:
-                    logger.warning(f"Failed to get memory {mem_id}: {e}|{traceback.format_exc()}")
-                    continue
-
-            if not memory_items:
-                logger.warning("No valid memory items found for processing")
-                return
-
-            # Use mem_reader to process the memories
-            logger.info(f"Processing {len(memory_items)} memories with mem_reader")
-            text_mem.memory_manager.remove_and_refresh_memory(user_name=user_name)
-            logger.info("Remove and Refresh Memories")
-            logger.debug(f"Finished add {user_id} memory: {mem_ids}")
-
-        except Exception:
-            logger.error(
-                f"Error in _process_memories_with_reorganize: {traceback.format_exc()}",
-                exc_info=True,
-            )
-
-    def process_session_turn(
-        self,
-        queries: str | list[str],
-        user_id: UserID | str,
-        mem_cube_id: MemCubeID | str,
-        mem_cube: GeneralMemCube,
-        top_k: int = 10,
-    ) -> tuple[list[TextualMemoryItem], list[TextualMemoryItem]] | None:
-        """
-        Process a dialog turn:
-        - If q_list reaches window size, trigger retrieval;
-        - Immediately switch to the new memory if retrieval is triggered.
-        """
-
-        text_mem_base = mem_cube.text_mem
-        if not isinstance(text_mem_base, TreeTextMemory):
-            if isinstance(text_mem_base, NaiveTextMemory):
-                logger.debug(
-                    f"NaiveTextMemory used for mem_cube_id={mem_cube_id}, processing session turn with simple search."
-                )
-                # Treat NaiveTextMemory similar to TreeTextMemory but with simpler logic
-                # We will perform retrieval to get "working memory" candidates for activation memory
-                # But we won't have a distinct "current working memory"
-                cur_working_memory = []
-            else:
-                logger.warning(
-                    f"Not implemented! Expected TreeTextMemory but got {type(text_mem_base).__name__} "
-                    f"for mem_cube_id={mem_cube_id}, user_id={user_id}. "
-                    f"text_mem_base value: {text_mem_base}"
-                )
-                return [], []
-        else:
-            cur_working_memory: list[TextualMemoryItem] = text_mem_base.get_working_memory(
-                user_name=mem_cube_id
-            )
-            cur_working_memory = cur_working_memory[:top_k]
-
-        logger.info(
-            f"[process_session_turn] Processing {len(queries)} queries for user_id={user_id}, mem_cube_id={mem_cube_id}"
-        )
-
-        text_working_memory: list[str] = [w_m.memory for w_m in cur_working_memory]
-        intent_result = self.monitor.detect_intent(
-            q_list=queries, text_working_memory=text_working_memory
-        )
-
-        time_trigger_flag = False
-        if self.monitor.timed_trigger(
-            last_time=self.monitor.last_query_consume_time,
-            interval_seconds=self.monitor.query_trigger_interval,
-        ):
-            time_trigger_flag = True
-
-        if (not intent_result["trigger_retrieval"]) and (not time_trigger_flag):
-            logger.info(
-                f"[process_session_turn] Query schedule not triggered for user_id={user_id}, mem_cube_id={mem_cube_id}. Intent_result: {intent_result}"
-            )
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, cannot register handlers")
             return
-        elif (not intent_result["trigger_retrieval"]) and time_trigger_flag:
-            logger.info(
-                f"[process_session_turn] Query schedule forced to trigger due to time ticker for user_id={user_id}, mem_cube_id={mem_cube_id}"
-            )
-            intent_result["trigger_retrieval"] = True
-            intent_result["missing_evidences"] = queries
-        else:
-            logger.info(
-                f"[process_session_turn] Query schedule triggered for user_id={user_id}, mem_cube_id={mem_cube_id}. "
-                f"Missing evidences: {intent_result['missing_evidences']}"
-            )
 
-        missing_evidences = intent_result["missing_evidences"]
-        num_evidence = len(missing_evidences)
-        k_per_evidence = max(1, top_k // max(1, num_evidence))
-        new_candidates = []
-        for item in missing_evidences:
-            logger.info(
-                f"[process_session_turn] Searching for missing evidence: '{item}' with top_k={k_per_evidence} for user_id={user_id}"
-            )
+        self.dispatcher.register_handlers(handlers)
 
-            # Determine search mode from method
-            from memos.mem_scheduler.schemas.general_schemas import (
-                TreeTextMemory_FINE_SEARCH_METHOD,
-                TreeTextMemory_SEARCH_METHOD,
-            )
-            from memos.types.general_types import SearchMode
+    def unregister_handlers(self, labels: list[str]) -> dict[str, bool]:
+        """
+        Unregister handlers from the dispatcher by their labels.
 
-            # Convert search_method to SearchMode
-            if self.search_method == TreeTextMemory_FINE_SEARCH_METHOD:
-                mode = SearchMode.FINE
-            elif self.search_method == TreeTextMemory_SEARCH_METHOD:
-                mode = SearchMode.FAST
-            else:
-                # Fallback to FAST mode for unknown methods
-                logger.warning(
-                    f"Unknown search_method '{self.search_method}', falling back to SearchMode.FAST"
+        Args:
+            labels: List of labels to unregister handlers for
+
+        Returns:
+            dict[str, bool]: Dictionary mapping each label to whether it was successfully unregistered
+        """
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, cannot unregister handlers")
+            return dict.fromkeys(labels, False)
+
+        return self.dispatcher.unregister_handlers(labels)
+
+    def get_running_tasks(self, filter_func: Callable | None = None) -> dict[str, dict]:
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, returning empty tasks dict")
+            return {}
+
+        running_tasks = self.dispatcher.get_running_tasks(filter_func=filter_func)
+
+        # Convert RunningTaskItem objects to dictionaries for easier consumption
+        result = {}
+        for task_id, task_item in running_tasks.items():
+            result[task_id] = {
+                "item_id": task_item.item_id,
+                "user_id": task_item.user_id,
+                "mem_cube_id": task_item.mem_cube_id,
+                "task_info": task_item.task_info,
+                "task_name": task_item.task_name,
+                "start_time": task_item.start_time,
+                "end_time": task_item.end_time,
+                "status": task_item.status,
+                "result": task_item.result,
+                "error_message": task_item.error_message,
+                "messages": task_item.messages,
+            }
+
+        return result
+
+    def get_tasks_status(self):
+        """Delegate status collection to TaskScheduleMonitor."""
+        return self.task_schedule_monitor.get_tasks_status()
+
+    def print_tasks_status(self, tasks_status: dict | None = None) -> None:
+        """Delegate pretty printing to TaskScheduleMonitor."""
+        self.task_schedule_monitor.print_tasks_status(tasks_status=tasks_status)
+
+    def _gather_queue_stats(self) -> dict:
+        """Collect queue/dispatcher stats for reporting."""
+        memos_message_queue = self.memos_message_queue.memos_message_queue
+        stats: dict[str, int | float | str] = {}
+        stats["use_redis_queue"] = bool(self.use_redis_queue)
+        # local queue metrics
+        if not self.use_redis_queue:
+            try:
+                stats["qsize"] = int(memos_message_queue.qsize())
+            except Exception:
+                stats["qsize"] = -1
+            # unfinished_tasks if available
+            try:
+                stats["unfinished_tasks"] = int(
+                    getattr(memos_message_queue, "unfinished_tasks", 0) or 0
                 )
-                mode = SearchMode.FAST
-
-            if isinstance(text_mem_base, NaiveTextMemory):
-                # NaiveTextMemory: Use direct search as fallback
-                try:
-                    results = text_mem_base.search(query=item, top_k=k_per_evidence)
-                except Exception as e:
-                    logger.warning(f"NaiveTextMemory search failed: {e}")
-                    results = []
-            else:
-                # Use unified search service
-                results: list[TextualMemoryItem] = self.search_service.search(
-                    query=item,
-                    user_id=user_id,
-                    mem_cube=mem_cube,
-                    top_k=k_per_evidence,
-                    mode=mode,
-                    mem_cube_id=mem_cube_id,
-                )
-
-            logger.info(
-                f"[process_session_turn] Search results for missing evidence '{item}': "
-                + ("\n- " + "\n- ".join([f"{one.id}: {one.memory}" for one in results]))
+            except Exception:
+                stats["unfinished_tasks"] = -1
+            stats["maxsize"] = int(self.max_internal_message_queue_size)
+            try:
+                maxsize = int(self.max_internal_message_queue_size) or 1
+                qsize = int(stats.get("qsize", 0))
+                stats["utilization"] = min(1.0, max(0.0, qsize / maxsize))
+            except Exception:
+                stats["utilization"] = 0.0
+        # dispatcher stats
+        try:
+            d_stats = self.dispatcher.stats()
+            stats.update(
+                {
+                    "running": int(d_stats.get("running", 0)),
+                    "inflight": int(d_stats.get("inflight", 0)),
+                    "handlers": int(d_stats.get("handlers", 0)),
+                }
             )
-            new_candidates.extend(results)
-        return cur_working_memory, new_candidates
+        except Exception:
+            stats.update({"running": 0, "inflight": 0, "handlers": 0})
+        return stats

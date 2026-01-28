@@ -92,8 +92,5 @@ class SchedulerContext:
     def send_add_log_messages_to_local_env(self, *args, **kwargs) -> None:
         self._scheduler.send_add_log_messages_to_local_env(*args, **kwargs)
 
-    def process_memories_with_reader(self, *args, **kwargs) -> None:
-        self._scheduler._process_memories_with_reader(*args, **kwargs)
-
     def process_memories_with_reorganize(self, *args, **kwargs) -> None:
         self._scheduler._process_memories_with_reorganize(*args, **kwargs)
