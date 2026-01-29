@@ -2,9 +2,11 @@ from collections.abc import Callable
 
 from memos.configs.mem_scheduler import GeneralSchedulerConfig
 from memos.log import get_logger
+from memos.mem_cube.general import GeneralMemCube
 from memos.mem_scheduler.base_scheduler import BaseScheduler
 from memos.mem_scheduler.general_modules.scheduler_context import SchedulerContext
 from memos.mem_scheduler.schemas.message_schemas import ScheduleMessageItem
+from memos.mem_scheduler.schemas.monitor_schemas import MemoryMonitorItem
 from memos.mem_scheduler.schemas.task_schemas import (
     ADD_TASK_LABEL,
     ANSWER_TASK_LABEL,
@@ -29,6 +31,16 @@ from memos.mem_scheduler.task_schedule_modules.handlers.memory_update_handler im
 )
 from memos.mem_scheduler.task_schedule_modules.handlers.pref_add_handler import PrefAddHandler
 from memos.mem_scheduler.task_schedule_modules.handlers.query_handler import QueryHandler
+from memos.mem_scheduler.utils.filter_utils import (
+    transform_name_to_key,
+)
+from memos.memories.textual.item import TextualMemoryItem
+from memos.memories.textual.naive import NaiveTextMemory
+from memos.memories.textual.tree import TreeTextMemory
+from memos.types import (
+    MemCubeID,
+    UserID,
+)
 
 
 logger = get_logger(__name__)
@@ -162,3 +174,228 @@ class GeneralScheduler(BaseScheduler):
         except Exception:
             stats.update({"running": 0, "inflight": 0, "handlers": 0})
         return stats
+
+    def transform_working_memories_to_monitors(
+        self, query_keywords, memories: list[TextualMemoryItem]
+    ) -> list[MemoryMonitorItem]:
+        """
+        Convert a list of TextualMemoryItem objects into MemoryMonitorItem objects
+        with importance scores based on keyword matching.
+
+        Args:
+            memories: List of TextualMemoryItem objects to be transformed.
+
+        Returns:
+            List of MemoryMonitorItem objects with computed importance scores.
+        """
+
+        result = []
+        mem_length = len(memories)
+        for idx, mem in enumerate(memories):
+            text_mem = mem.memory
+            mem_key = transform_name_to_key(name=text_mem)
+
+            # Calculate importance score based on keyword matches
+            keywords_score = 0
+            if query_keywords and text_mem:
+                for keyword, count in query_keywords.items():
+                    keyword_count = text_mem.count(keyword)
+                    if keyword_count > 0:
+                        keywords_score += keyword_count * count
+                        logger.debug(
+                            f"Matched keyword '{keyword}' {keyword_count} times, added {keywords_score} to keywords_score"
+                        )
+
+            # rank score
+            sorting_score = mem_length - idx
+
+            mem_monitor = MemoryMonitorItem(
+                memory_text=text_mem,
+                tree_memory_item=mem,
+                tree_memory_item_mapping_key=mem_key,
+                sorting_score=sorting_score,
+                keywords_score=keywords_score,
+                recording_count=1,
+            )
+            result.append(mem_monitor)
+
+        logger.info(f"Transformed {len(result)} memories to monitors")
+        return result
+
+    def replace_working_memory(
+        self,
+        user_id: UserID | str,
+        mem_cube_id: MemCubeID | str,
+        mem_cube: GeneralMemCube,
+        original_memory: list[TextualMemoryItem],
+        new_memory: list[TextualMemoryItem],
+    ) -> None | list[TextualMemoryItem]:
+        """Replace working memory with new memories after reranking."""
+        text_mem_base = mem_cube.text_mem
+        if isinstance(text_mem_base, TreeTextMemory):
+            text_mem_base: TreeTextMemory = text_mem_base
+
+            # process rerank memories with llm
+            query_db_manager = self.monitor.query_monitors[user_id][mem_cube_id]
+            # Sync with database to get latest query history
+            query_db_manager.sync_with_orm()
+
+            query_history = query_db_manager.obj.get_queries_with_timesort()
+
+            original_count = len(original_memory)
+            # Filter out memories tagged with "mode:fast"
+            filtered_original_memory = []
+            for origin_mem in original_memory:
+                if "mode:fast" not in origin_mem.metadata.tags:
+                    filtered_original_memory.append(origin_mem)
+                else:
+                    logger.debug(
+                        f"Filtered out memory - ID: {getattr(origin_mem, 'id', 'unknown')}, Tags: {origin_mem.metadata.tags}"
+                    )
+            # Calculate statistics
+            filtered_count = original_count - len(filtered_original_memory)
+            remaining_count = len(filtered_original_memory)
+
+            logger.info(
+                f"Filtering complete. Removed {filtered_count} memories with tag 'mode:fast'. Remaining memories: {remaining_count}"
+            )
+            original_memory = filtered_original_memory
+
+            memories_with_new_order, rerank_success_flag = (
+                self.post_processor.process_and_rerank_memories(
+                    queries=query_history,
+                    original_memory=original_memory,
+                    new_memory=new_memory,
+                    top_k=self.top_k,
+                )
+            )
+
+            # Filter completely unrelated memories according to query_history
+            logger.info(f"Filtering memories based on query history: {len(query_history)} queries")
+            filtered_memories, filter_success_flag = self.post_processor.filter_unrelated_memories(
+                query_history=query_history,
+                memories=memories_with_new_order,
+            )
+
+            if filter_success_flag:
+                logger.info(
+                    f"Memory filtering completed successfully. "
+                    f"Filtered from {len(memories_with_new_order)} to {len(filtered_memories)} memories"
+                )
+                memories_with_new_order = filtered_memories
+            else:
+                logger.warning(
+                    "Memory filtering failed - keeping all memories as fallback. "
+                    f"Original count: {len(memories_with_new_order)}"
+                )
+
+            # Update working memory monitors
+            query_keywords = query_db_manager.obj.get_keywords_collections()
+            logger.info(
+                f"Processing {len(memories_with_new_order)} memories with {len(query_keywords)} query keywords"
+            )
+            new_working_memory_monitors = self.transform_working_memories_to_monitors(
+                query_keywords=query_keywords,
+                memories=memories_with_new_order,
+            )
+
+            if not rerank_success_flag:
+                for one in new_working_memory_monitors:
+                    one.sorting_score = 0
+
+            logger.info(f"update {len(new_working_memory_monitors)} working_memory_monitors")
+            self.monitor.update_working_memory_monitors(
+                new_working_memory_monitors=new_working_memory_monitors,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+            )
+
+            mem_monitors: list[MemoryMonitorItem] = self.monitor.working_memory_monitors[user_id][
+                mem_cube_id
+            ].obj.get_sorted_mem_monitors(reverse=True)
+            new_working_memories = [mem_monitor.tree_memory_item for mem_monitor in mem_monitors]
+
+            text_mem_base.replace_working_memory(memories=new_working_memories)
+
+            logger.info(
+                f"The working memory has been replaced with {len(memories_with_new_order)} new memories."
+            )
+            self.log_working_memory_replacement(
+                original_memory=original_memory,
+                new_memory=new_working_memories,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+                log_func_callback=self._submit_web_logs,
+            )
+        elif isinstance(text_mem_base, NaiveTextMemory):
+            # For NaiveTextMemory, we populate the monitors with the new candidates so activation memory can pick them up
+            logger.info(
+                f"NaiveTextMemory: Updating working memory monitors with {len(new_memory)} candidates."
+            )
+
+            # Use query keywords if available, otherwise just basic monitoring
+            query_db_manager = self.monitor.query_monitors[user_id][mem_cube_id]
+            query_db_manager.sync_with_orm()
+            query_keywords = query_db_manager.obj.get_keywords_collections()
+
+            new_working_memory_monitors = self.transform_working_memories_to_monitors(
+                query_keywords=query_keywords,
+                memories=new_memory,
+            )
+
+            self.monitor.update_working_memory_monitors(
+                new_working_memory_monitors=new_working_memory_monitors,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+            )
+            memories_with_new_order = new_memory
+        else:
+            logger.error("memory_base is not supported")
+            memories_with_new_order = new_memory
+
+        return memories_with_new_order
+
+    def update_activation_memory(
+        self,
+        new_memories: list[str | TextualMemoryItem],
+        label: str,
+        user_id: UserID | str,
+        mem_cube_id: MemCubeID | str,
+        mem_cube: GeneralMemCube,
+    ) -> None:
+        """
+        Update activation memory by extracting KVCacheItems from new_memory (list of str),
+        add them to a KVCacheMemory instance, and dump to disk.
+        """
+        if self.activation_memory_manager:
+            self.activation_memory_manager.update_activation_memory(
+                new_memories=new_memories,
+                label=label,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+            )
+        else:
+            logger.warning("Activation memory manager not initialized")
+
+    def update_activation_memory_periodically(
+        self,
+        interval_seconds: int,
+        label: str,
+        user_id: UserID | str,
+        mem_cube_id: MemCubeID | str,
+        mem_cube: GeneralMemCube,
+    ):
+        if self.activation_memory_manager:
+            self.activation_memory_manager.update_activation_memory_periodically(
+                interval_seconds=interval_seconds,
+                label=label,
+                user_id=user_id,
+                mem_cube_id=mem_cube_id,
+                mem_cube=mem_cube,
+            )
+        else:
+            logger.warning("Activation memory manager not initialized")
