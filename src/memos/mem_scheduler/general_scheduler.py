@@ -16,6 +16,7 @@ from memos.mem_scheduler.schemas.task_schemas import (
     MEM_UPDATE_TASK_LABEL,
     PREF_ADD_TASK_LABEL,
     QUERY_TASK_LABEL,
+    TaskPriorityLevel,
 )
 from memos.mem_scheduler.task_schedule_modules.handlers.add_handler import AddHandler
 from memos.mem_scheduler.task_schedule_modules.handlers.answer_handler import AnswerHandler
@@ -59,13 +60,13 @@ class GeneralScheduler(BaseScheduler):
         # register handlers
         memory_update_handler = MemoryUpdateHandler(context)
         handlers = {
-            QUERY_TASK_LABEL: QueryHandler(context, memory_update_handler),
-            ANSWER_TASK_LABEL: AnswerHandler(context),
+            QUERY_TASK_LABEL: (QueryHandler(context), TaskPriorityLevel.LEVEL_1, None),
+            ANSWER_TASK_LABEL: (AnswerHandler(context), TaskPriorityLevel.LEVEL_1, None),
             MEM_UPDATE_TASK_LABEL: memory_update_handler,
-            ADD_TASK_LABEL: AddHandler(context),
+            ADD_TASK_LABEL: (AddHandler(context), TaskPriorityLevel.LEVEL_1, None),
             MEM_READ_TASK_LABEL: MemReadHandler(context),
             MEM_ORGANIZE_TASK_LABEL: MemReorganizeHandler(context),
-            PREF_ADD_TASK_LABEL: PrefAddHandler(context),
+            PREF_ADD_TASK_LABEL: (PrefAddHandler(context), None, 600_000),
             MEM_FEEDBACK_TASK_LABEL: MemFeedbackHandler(context),
         }
         self.dispatcher.register_handlers(handlers)

@@ -68,12 +68,6 @@ class SchedulerContext:
     def submit_messages(self, messages: list["ScheduleMessageItem"]) -> None:
         self._scheduler.submit_messages(messages)
 
-    def long_memory_update_process(self, *args, **kwargs) -> None:
-        self._scheduler.long_memory_update_process(*args, **kwargs)
-
-    def process_session_turn(self, *args, **kwargs) -> Any:
-        return self._scheduler.process_session_turn(*args, **kwargs)
-
     def replace_working_memory(self, *args, **kwargs) -> Any:
         return self._scheduler.replace_working_memory(*args, **kwargs)
 
