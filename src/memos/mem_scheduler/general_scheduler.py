@@ -222,6 +222,100 @@ class GeneralScheduler(BaseScheduler):
         logger.info(f"Transformed {len(result)} memories to monitors")
         return result
 
+    def _filter_fast_memories(
+        self, original_memory: list[TextualMemoryItem]
+    ) -> list[TextualMemoryItem]:
+        """Filter out memories tagged with 'mode:fast'."""
+        filtered_original_memory = []
+        original_count = len(original_memory)
+        for origin_mem in original_memory:
+            if "mode:fast" not in origin_mem.metadata.tags:
+                filtered_original_memory.append(origin_mem)
+            else:
+                logger.debug(
+                    f"Filtered out memory - ID: {getattr(origin_mem, 'id', 'unknown')}, Tags: {origin_mem.metadata.tags}"
+                )
+
+        filtered_count = original_count - len(filtered_original_memory)
+        remaining_count = len(filtered_original_memory)
+        logger.info(
+            f"Filtering complete. Removed {filtered_count} memories with tag 'mode:fast'. Remaining memories: {remaining_count}"
+        )
+        return filtered_original_memory
+
+    def _apply_rerank_and_filter(
+        self,
+        query_history: list[str],
+        original_memory: list[TextualMemoryItem],
+        new_memory: list[TextualMemoryItem],
+    ) -> tuple[list[TextualMemoryItem], bool]:
+        """Apply reranking and filtering to memories."""
+        memories_with_new_order, rerank_success_flag = (
+            self.post_processor.process_and_rerank_memories(
+                queries=query_history,
+                original_memory=original_memory,
+                new_memory=new_memory,
+                top_k=self.top_k,
+            )
+        )
+
+        logger.info(f"Filtering memories based on query history: {len(query_history)} queries")
+        filtered_memories, filter_success_flag = self.post_processor.filter_unrelated_memories(
+            query_history=query_history,
+            memories=memories_with_new_order,
+        )
+
+        if filter_success_flag:
+            logger.info(
+                f"Memory filtering completed successfully. "
+                f"Filtered from {len(memories_with_new_order)} to {len(filtered_memories)} memories"
+            )
+            memories_with_new_order = filtered_memories
+        else:
+            logger.warning(
+                "Memory filtering failed - keeping all memories as fallback. "
+                f"Original count: {len(memories_with_new_order)}"
+            )
+
+        return memories_with_new_order, rerank_success_flag
+
+    def _update_working_memory_monitors(
+        self,
+        memories_with_new_order: list[TextualMemoryItem],
+        rerank_success_flag: bool,
+        query_db_manager,
+        user_id: str,
+        mem_cube_id: str,
+        mem_cube: GeneralMemCube,
+    ) -> list[TextualMemoryItem]:
+        """Update working memory monitors and return new working memories."""
+        query_keywords = query_db_manager.obj.get_keywords_collections()
+        logger.info(
+            f"Processing {len(memories_with_new_order)} memories with {len(query_keywords)} query keywords"
+        )
+
+        new_working_memory_monitors = self.transform_working_memories_to_monitors(
+            query_keywords=query_keywords,
+            memories=memories_with_new_order,
+        )
+
+        if not rerank_success_flag:
+            for one in new_working_memory_monitors:
+                one.sorting_score = 0
+
+        logger.info(f"update {len(new_working_memory_monitors)} working_memory_monitors")
+        self.monitor.update_working_memory_monitors(
+            new_working_memory_monitors=new_working_memory_monitors,
+            user_id=user_id,
+            mem_cube_id=mem_cube_id,
+            mem_cube=mem_cube,
+        )
+
+        mem_monitors: list[MemoryMonitorItem] = self.monitor.working_memory_monitors[user_id][
+            mem_cube_id
+        ].obj.get_sorted_mem_monitors(reverse=True)
+        return [mem_monitor.tree_memory_item for mem_monitor in mem_monitors]
+
     def replace_working_memory(
         self,
         user_id: UserID | str,
@@ -232,89 +326,32 @@ class GeneralScheduler(BaseScheduler):
     ) -> None | list[TextualMemoryItem]:
         """Replace working memory with new memories after reranking."""
         text_mem_base = mem_cube.text_mem
+
         if isinstance(text_mem_base, TreeTextMemory):
             text_mem_base: TreeTextMemory = text_mem_base
 
             # process rerank memories with llm
             query_db_manager = self.monitor.query_monitors[user_id][mem_cube_id]
-            # Sync with database to get latest query history
             query_db_manager.sync_with_orm()
-
             query_history = query_db_manager.obj.get_queries_with_timesort()
 
-            original_count = len(original_memory)
-            # Filter out memories tagged with "mode:fast"
-            filtered_original_memory = []
-            for origin_mem in original_memory:
-                if "mode:fast" not in origin_mem.metadata.tags:
-                    filtered_original_memory.append(origin_mem)
-                else:
-                    logger.debug(
-                        f"Filtered out memory - ID: {getattr(origin_mem, 'id', 'unknown')}, Tags: {origin_mem.metadata.tags}"
-                    )
-            # Calculate statistics
-            filtered_count = original_count - len(filtered_original_memory)
-            remaining_count = len(filtered_original_memory)
+            # 1. Filter fast memories
+            filtered_original_memory = self._filter_fast_memories(original_memory)
 
-            logger.info(
-                f"Filtering complete. Removed {filtered_count} memories with tag 'mode:fast'. Remaining memories: {remaining_count}"
-            )
-            original_memory = filtered_original_memory
-
-            memories_with_new_order, rerank_success_flag = (
-                self.post_processor.process_and_rerank_memories(
-                    queries=query_history,
-                    original_memory=original_memory,
-                    new_memory=new_memory,
-                    top_k=self.top_k,
-                )
+            # 2. Rerank and Filter
+            memories_with_new_order, rerank_success_flag = self._apply_rerank_and_filter(
+                query_history, filtered_original_memory, new_memory
             )
 
-            # Filter completely unrelated memories according to query_history
-            logger.info(f"Filtering memories based on query history: {len(query_history)} queries")
-            filtered_memories, filter_success_flag = self.post_processor.filter_unrelated_memories(
-                query_history=query_history,
-                memories=memories_with_new_order,
+            # 3. Update Monitors
+            new_working_memories = self._update_working_memory_monitors(
+                memories_with_new_order,
+                rerank_success_flag,
+                query_db_manager,
+                user_id,
+                mem_cube_id,
+                mem_cube,
             )
-
-            if filter_success_flag:
-                logger.info(
-                    f"Memory filtering completed successfully. "
-                    f"Filtered from {len(memories_with_new_order)} to {len(filtered_memories)} memories"
-                )
-                memories_with_new_order = filtered_memories
-            else:
-                logger.warning(
-                    "Memory filtering failed - keeping all memories as fallback. "
-                    f"Original count: {len(memories_with_new_order)}"
-                )
-
-            # Update working memory monitors
-            query_keywords = query_db_manager.obj.get_keywords_collections()
-            logger.info(
-                f"Processing {len(memories_with_new_order)} memories with {len(query_keywords)} query keywords"
-            )
-            new_working_memory_monitors = self.transform_working_memories_to_monitors(
-                query_keywords=query_keywords,
-                memories=memories_with_new_order,
-            )
-
-            if not rerank_success_flag:
-                for one in new_working_memory_monitors:
-                    one.sorting_score = 0
-
-            logger.info(f"update {len(new_working_memory_monitors)} working_memory_monitors")
-            self.monitor.update_working_memory_monitors(
-                new_working_memory_monitors=new_working_memory_monitors,
-                user_id=user_id,
-                mem_cube_id=mem_cube_id,
-                mem_cube=mem_cube,
-            )
-
-            mem_monitors: list[MemoryMonitorItem] = self.monitor.working_memory_monitors[user_id][
-                mem_cube_id
-            ].obj.get_sorted_mem_monitors(reverse=True)
-            new_working_memories = [mem_monitor.tree_memory_item for mem_monitor in mem_monitors]
 
             text_mem_base.replace_working_memory(memories=new_working_memories)
 
@@ -329,6 +366,8 @@ class GeneralScheduler(BaseScheduler):
                 mem_cube=mem_cube,
                 log_func_callback=self._submit_web_logs,
             )
+            return memories_with_new_order
+
         elif isinstance(text_mem_base, NaiveTextMemory):
             # For NaiveTextMemory, we populate the monitors with the new candidates so activation memory can pick them up
             logger.info(
@@ -351,12 +390,10 @@ class GeneralScheduler(BaseScheduler):
                 mem_cube_id=mem_cube_id,
                 mem_cube=mem_cube,
             )
-            memories_with_new_order = new_memory
+            return new_memory
         else:
             logger.error("memory_base is not supported")
-            memories_with_new_order = new_memory
-
-        return memories_with_new_order
+            return new_memory
 
     def update_activation_memory(
         self,

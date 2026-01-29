@@ -3,6 +3,7 @@ from memos.mem_cube.general import GeneralMemCube
 from memos.mem_scheduler.general_modules.scheduler_context import SchedulerContext
 from memos.mem_scheduler.schemas.message_schemas import ScheduleMessageItem
 from memos.mem_scheduler.schemas.task_schemas import (
+    MEM_UPDATE_TASK_LABEL,
     NOT_APPLICABLE_TYPE,
     QUERY_TASK_LABEL,
     USER_INPUT_TYPE,
@@ -200,5 +201,21 @@ class QueryHandler(BaseHandler):
             except Exception as e:
                 self.handle_exception(e, "Failed to record addMessage log for query")
 
-        # Directly call the MemoryUpdateHandler
-        self.memory_update_handler.batch_handler(user_id, mem_cube_id, batch)
+        # Submit memory update tasks to scheduler instead of direct call
+        update_msgs = []
+        for msg in batch:
+            update_msg = ScheduleMessageItem(
+                label=MEM_UPDATE_TASK_LABEL,
+                user_id=msg.user_id,
+                mem_cube_id=msg.mem_cube_id,
+                content=msg.content,
+                item_id=msg.item_id,
+                task_id=msg.task_id,
+                user_name=msg.user_name,
+                trace_id=msg.trace_id,
+                info=msg.info,
+            )
+            update_msgs.append(update_msg)
+
+        if update_msgs:
+            self.context.submit_messages(update_msgs)
