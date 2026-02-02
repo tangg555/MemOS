@@ -24,6 +24,7 @@ from memos.mem_scheduler.schemas.general_schemas import (
     DEFAULT_TOP_K,
     DEFAULT_USE_REDIS_QUEUE,
     DEFAULT_WORKING_MEM_MONITOR_SIZE_LIMIT,
+    TreeTextMemory_SEARCH_METHOD,
 )
 
 
@@ -33,6 +34,10 @@ class BaseSchedulerConfig(BaseConfig):
     top_k: int = Field(
         default=DEFAULT_TOP_K,
         description="Number of top candidates to consider in initial retrieval",
+    )
+    search_method: str = Field(
+        default=TreeTextMemory_SEARCH_METHOD,
+        description="Search method to use (e.g., tree_text_memory_search, tree_text_memory_fine_search)",
     )
     enable_parallel_dispatch: bool = Field(
         default=True, description="Whether to enable parallel message processing using thread pool"
