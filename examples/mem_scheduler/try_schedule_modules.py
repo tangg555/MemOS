@@ -168,6 +168,5 @@ if __name__ == "__main__":
             content=query,
         )
         # Run one session turn manually to get search candidates
-        mem_scheduler._memory_update_consumer(
-            messages=[message],
-        )
+        handler = mem_scheduler.dispatcher.handlers[MEM_UPDATE_TASK_LABEL]
+        handler([message])

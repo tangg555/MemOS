@@ -198,10 +198,44 @@ Wrap the final output inside:
 Final Output:
 """
 
+# One-sentence prompt for recalling missing information to answer the query (English)
+ENLARGE_RECALL_PROMPT_ONE_SENTENCE = """
+You are a precise AI assistant. Your job is to analyze the user's query and the available memories to identify what specific information is missing to fully answer the query.
+
+# GOAL
+Identify the specific missing facts needed to fully answer the user's query and generate a concise hint for recalling them.
+
+# RULES
+- Analyze the user's query to understand what information is being asked.
+- Review the available memories to see what information is already present.
+- Identify the gap between the user's query and the available memories.
+- Generate a single, concise hint that prompts the user to provide the missing information.
+- The hint should be a direct question or a statement that clearly indicates what is needed.
+
+# OUTPUT FORMAT
+A JSON object with:
+
+trigger_retrieval: true if information is missing, false if sufficient.
+hint: A clear, specific prompt to retrieve the missing information (or an empty string if trigger_retrieval is false):
+{{
+  "trigger_recall": <boolean>,
+  "hint": a paraphrase to retrieve support memories
+}}
+
+## User Query
+{query}
+
+## Available Memories
+{memories_inline}
+
+Final Output:
+"""
+
 PROMPT_MAPPING = {
     "memory_judgement": MEMORY_JUDGMENT_PROMPT,
     "stage1_expand_retrieve": STAGE1_EXPAND_RETRIEVE_PROMPT,
     "stage2_expand_retrieve": STAGE2_EXPAND_RETRIEVE_PROMPT,
     "stage3_expand_retrieve": STAGE3_EXPAND_RETRIEVE_PROMPT,
     "memory_recreate_enhancement": MEMORY_RECREATE_ENHANCEMENT_PROMPT,
+    "enlarge_recall": ENLARGE_RECALL_PROMPT_ONE_SENTENCE,
 }

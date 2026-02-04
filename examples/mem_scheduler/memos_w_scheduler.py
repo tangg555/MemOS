@@ -36,6 +36,7 @@ from memos.mem_scheduler.schemas.task_schemas import (  # noqa: E402
     MEM_UPDATE_TASK_LABEL,
     QUERY_TASK_LABEL,
 )
+from memos.types.general_types import SearchMode  # noqa: E402
 
 
 logger = get_logger(__name__)
@@ -105,14 +106,14 @@ def custom_mem_update_handler(messages: list[ScheduleMessageItem]):
     top_k = 2
     for msg in messages:
         # Search for memories relevant to the current content in text memory (return top_k=2)
-        results = mem_scheduler.retriever.search(
+        results = mem_scheduler.search_service.search(
             query=msg.content,
             user_id=msg.user_id,
             mem_cube_id=msg.mem_cube_id,
             mem_cube=mem_scheduler.current_mem_cube,
             top_k=top_k,
-            method=mem_scheduler.search_method,
-            search_args=search_args,
+            mode=SearchMode.FAST,
+            search_filter=search_args,
         )
         working_memories.extend(results)
         working_memories = working_memories[-5:]
